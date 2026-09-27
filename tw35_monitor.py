@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TW35 Monitor v1.0
+TW35 Monitor v1.1
 =================
 
 台股 3~5% 趨勢短打雷達
@@ -38,6 +38,7 @@ ENTRY
 - 接近漲停不追
 - 開盤大幅跳空時前30分鐘不追
 - 收盤後可手動測試，但不發正式ENTRY進場通知
+- 自動抓最近實際交易日的開盤跳空
 
 資料：
 Yahoo Finance 公開圖表資料
@@ -167,7 +168,6 @@ def market_open_now():
 
     now = now_taipei()
 
-    # 星期一 ~ 星期五
     if now.weekday() >= 5:
         return False
 
@@ -272,7 +272,7 @@ def yahoo_get(
                 url,
                 headers={
                     "User-Agent":
-                        "Mozilla/5.0 TW35-Monitor/1.0",
+                        "Mozilla/5.0 TW35-Monitor/1.1",
 
                     "Accept":
                         "application/json",
@@ -412,6 +412,157 @@ def fetch_chart(
 
 
 # ============================================================
+# 交易日工具
+# ============================================================
+
+def row_local_date(row):
+
+    return (
+        datetime
+        .fromtimestamp(
+            row["t"],
+            timezone.utc
+        )
+        .astimezone(
+            TAIPEI
+        )
+        .date()
+    )
+
+
+def group_rows_by_date(rows):
+
+    groups = {}
+
+    for r in rows:
+
+        d = row_local_date(r)
+
+        groups.setdefault(
+            d,
+            []
+        ).append(r)
+
+    return groups
+
+
+def latest_trade_day_info(
+    r5,
+    rd
+):
+
+    """
+    回傳最近一個實際有5m資料的交易日：
+    - trade_date
+    - open_price
+    - previous_close
+    - gap_pct
+    """
+
+    if not r5:
+        return {
+            "trade_date": None,
+            "open_price": None,
+            "previous_close": None,
+            "gap_pct": None,
+        }
+
+    intraday_groups = (
+        group_rows_by_date(
+            r5
+        )
+    )
+
+    trade_dates = sorted(
+        intraday_groups.keys()
+    )
+
+    if not trade_dates:
+        return {
+            "trade_date": None,
+            "open_price": None,
+            "previous_close": None,
+            "gap_pct": None,
+        }
+
+    latest_trade_date = (
+        trade_dates[-1]
+    )
+
+    latest_day_rows = (
+        intraday_groups[
+            latest_trade_date
+        ]
+    )
+
+    latest_day_rows.sort(
+        key=lambda x: x["t"]
+    )
+
+    open_price = (
+        latest_day_rows[0]["o"]
+        if latest_day_rows
+        else None
+    )
+
+    daily_by_date = {}
+
+    for r in rd:
+
+        d = row_local_date(r)
+
+        daily_by_date[d] = r
+
+    earlier_daily_dates = sorted(
+        [
+            d
+            for d in daily_by_date.keys()
+            if d < latest_trade_date
+        ]
+    )
+
+    previous_close = None
+
+    if earlier_daily_dates:
+
+        prev_date = (
+            earlier_daily_dates[-1]
+        )
+
+        previous_close = (
+            daily_by_date[
+                prev_date
+            ]["c"]
+        )
+
+    gap_pct = (
+        pct_change(
+            previous_close,
+            open_price
+        )
+        if (
+            previous_close is not None
+            and open_price is not None
+        )
+        else None
+    )
+
+    return {
+        "trade_date":
+            latest_trade_date,
+
+        "open_price":
+            open_price,
+
+        "previous_close":
+            previous_close,
+
+        "gap_pct":
+            gap_pct,
+    }
+
+
+# ============================================================
 # 均線與ATR
 # ============================================================
 
@@ -538,7 +689,7 @@ def add_indicators(rows):
 
 
 # ============================================================
-# 1H 趨勢
+# 訊號條件
 # ============================================================
 
 def one_hour_trend(r):
@@ -576,10 +727,6 @@ def one_hour_trend(r):
     )
 
 
-# ============================================================
-# 15m READY
-# ============================================================
-
 def fifteen_ready(r):
 
     needed = [
@@ -604,10 +751,6 @@ def fifteen_ready(r):
         >= r["ma10"] * 0.995
     )
 
-
-# ============================================================
-# 5m ENTRY
-# ============================================================
 
 def five_entry(
     current,
@@ -679,7 +822,6 @@ def recent_resistance(
 
     candidates = []
 
-    # 最近約5個交易日的1H高點
     for r in r1[-30:]:
 
         if r["h"] > price:
@@ -688,7 +830,6 @@ def recent_resistance(
                 r["h"]
             )
 
-    # 最近約3個月日線高點
     for r in daily[-60:]:
 
         if r["h"] > price:
@@ -729,7 +870,6 @@ def estimate_potential(
         "atr14"
     )
 
-
     atr_pct = None
 
     if (
@@ -756,7 +896,6 @@ def estimate_potential(
         ) * 100
 
 
-    # 台股短打先採約 2 ATR
     atr_target_pct = None
 
     if atr_pct is not None:
@@ -856,8 +995,6 @@ def estimate_potential(
         + trend_bonus
     )
 
-
-    # 防止預估太誇張
     potential_pct = max(
         0.5,
         min(
@@ -964,28 +1101,24 @@ def analyze(
     name = info["name"]
 
 
-    # 5分鐘
     r5, meta5 = fetch_chart(
         ticker,
         "5m",
         "5d"
     )
 
-    # 15分鐘
     r15, _ = fetch_chart(
         ticker,
         "15m",
         "5d"
     )
 
-    # 60分鐘
     r1, _ = fetch_chart(
         ticker,
         "60m",
         "1mo"
     )
 
-    # 日線
     rd, _ = fetch_chart(
         ticker,
         "1d",
@@ -1044,12 +1177,41 @@ def analyze(
     )
 
 
-    # 前一交易日收盤
-    previous_close = None
+    # ========================================================
+    # 最近實際交易日資料
+    # ========================================================
 
-    if len(rd) >= 2:
+    trade_info = (
+        latest_trade_day_info(
+            r5,
+            rd
+        )
+    )
 
-        previous_close = rd[-2]["c"]
+
+    previous_close = (
+        trade_info[
+            "previous_close"
+        ]
+    )
+
+    first_open = (
+        trade_info[
+            "open_price"
+        ]
+    )
+
+    gap_pct = (
+        trade_info[
+            "gap_pct"
+        ]
+    )
+
+    trade_date = (
+        trade_info[
+            "trade_date"
+        ]
+    )
 
 
     day_change_pct = (
@@ -1058,52 +1220,6 @@ def analyze(
             current_price
         )
         if previous_close
-        else None
-    )
-
-
-    # 今日第一根5m開盤
-    today = now_taipei().date()
-
-    today_rows = []
-
-    for r in r5:
-
-        d = (
-            datetime
-            .fromtimestamp(
-                r["t"],
-                timezone.utc
-            )
-            .astimezone(
-                TAIPEI
-            )
-            .date()
-        )
-
-        if d == today:
-
-            today_rows.append(r)
-
-
-    first_open = None
-
-    if today_rows:
-
-        first_open = (
-            today_rows[0]["o"]
-        )
-
-
-    gap_pct = (
-        pct_change(
-            previous_close,
-            first_open
-        )
-        if (
-            previous_close
-            and first_open
-        )
         else None
     )
 
@@ -1260,6 +1376,14 @@ def analyze(
         "5m":
             m5,
 
+        "trade_date":
+            str(trade_date)
+            if trade_date
+            else None,
+
+        "first_open":
+            first_open,
+
         "previous_close":
             previous_close,
 
@@ -1309,7 +1433,6 @@ def send_ntfy(
         return False
 
 
-    # ntfy Title 用ASCII最穩定
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
         data=message.encode(
@@ -1811,10 +1934,32 @@ def send_entry(
     )
 
 
+    volume_text = (
+        f"{volume:.2f}"
+        if volume is not None
+        else "N/A"
+    )
+
+
     message = (
         f"{r['code']} {r['name']}\n\n"
 
         f"{stage_block(s)}\n\n"
+
+        f"交易日："
+        f"{r['trade_date']}\n"
+
+        f"前收："
+        f"{price_text(r['previous_close'])}\n"
+
+        f"開盤："
+        f"{price_text(r['first_open'])}\n"
+
+        f"開盤跳空："
+        f"{pct_text(r['gap_pct'])}\n"
+
+        f"當日漲跌："
+        f"{pct_text(r['day_change_pct'])}\n\n"
 
         f"原始預估目標："
         f"{price_text(target)}\n"
@@ -1838,18 +1983,7 @@ def send_entry(
         f"{pct_text(atr)}\n"
 
         f"5m量能比："
-        f"{volume:.2f}\n"
-        if volume is not None
-        else "5m量能比：N/A\n"
-    )
-
-
-    message += (
-        f"\n今日漲跌："
-        f"{pct_text(r['day_change_pct'])}\n"
-
-        f"開盤跳空："
-        f"{pct_text(r['gap_pct'])}\n"
+        f"{volume_text}\n"
     )
 
 
@@ -1947,6 +2081,19 @@ def notify_status(
             (
                 f"{code} {r['name']}\n\n"
                 f"{stage_block(s)}\n\n"
+
+                f"交易日："
+                f"{r['trade_date']}\n"
+
+                f"前收："
+                f"{price_text(r['previous_close'])}\n"
+
+                f"開盤："
+                f"{price_text(r['first_open'])}\n"
+
+                f"跳空："
+                f"{pct_text(r['gap_pct'])}\n\n"
+
                 f"1H=True\n"
                 f"15m=True\n"
                 f"5m=False\n\n"
@@ -1964,6 +2111,19 @@ def notify_status(
             (
                 f"{code} {r['name']}\n\n"
                 f"{stage_block(s)}\n\n"
+
+                f"交易日："
+                f"{r['trade_date']}\n"
+
+                f"前收："
+                f"{price_text(r['previous_close'])}\n"
+
+                f"開盤："
+                f"{price_text(r['first_open'])}\n"
+
+                f"跳空："
+                f"{pct_text(r['gap_pct'])}\n\n"
+
                 f"1H=True\n"
                 f"15m=False\n\n"
                 f"等待READY。"
@@ -2172,7 +2332,7 @@ def send_summary(
 def main():
 
     print(
-        "TW35 Monitor | v1.0"
+        "TW35 Monitor | v1.1"
     )
 
     print(
@@ -2229,11 +2389,14 @@ def main():
                 f"{info['name']:<8} "
                 f"{r['status']:<10} "
                 f"price={price_text(r['price'])} "
+                f"trade_date={r['trade_date']} "
+                f"prev={price_text(r['previous_close'])} "
+                f"open={price_text(r['first_open'])} "
+                f"gap={pct_text(r['gap_pct'])} "
+                f"day={pct_text(r['day_change_pct'])} "
                 f"1H={r['1h']} "
                 f"15m={r['15m']} "
                 f"5m={r['5m']} "
-                f"day={pct_text(r['day_change_pct'])} "
-                f"gap={pct_text(r['gap_pct'])} "
                 f"allowed={r['entry_allowed']}"
             )
 
