@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TW35 Monitor v1.1
+TW35 Monitor v1.2
 =================
 
 台股 3~5% 趨勢短打雷達
@@ -40,6 +40,10 @@ ENTRY
 - 收盤後可手動測試，但不發正式ENTRY進場通知
 - 自動抓最近實際交易日的開盤跳空
 
+v1.2：
+- 監控池擴充為20檔
+- 電子 / 金融 / 航運 / 傳產 / 民生 / 電信 / ETF
+
 資料：
 Yahoo Finance 公開圖表資料
 不需API Key
@@ -72,49 +76,138 @@ STATE_FILE = STATE_DIR / "state.json"
 
 
 # ============================================================
-# 第一批監控標的
+# 20檔跨產業監控池
 # ============================================================
 
 SYMBOLS = {
+
+    # ========================================================
+    # 電子 / 科技
+    # ========================================================
+
     "2330": {
         "name": "台積電",
         "ticker": "2330.TW",
     },
-    "2317": {
-        "name": "鴻海",
-        "ticker": "2317.TW",
-    },
+
     "2454": {
         "name": "聯發科",
         "ticker": "2454.TW",
     },
-    "2382": {
-        "name": "廣達",
-        "ticker": "2382.TW",
-    },
-    "3231": {
-        "name": "緯創",
-        "ticker": "3231.TW",
-    },
+
     "2308": {
         "name": "台達電",
         "ticker": "2308.TW",
     },
-    "2345": {
-        "name": "智邦",
-        "ticker": "2345.TW",
-    },
-    "3661": {
-        "name": "世芯-KY",
-        "ticker": "3661.TW",
-    },
-    "3443": {
-        "name": "創意",
-        "ticker": "3443.TW",
-    },
+
     "3017": {
         "name": "奇鋐",
         "ticker": "3017.TW",
+    },
+
+    "2317": {
+        "name": "鴻海",
+        "ticker": "2317.TW",
+    },
+
+
+    # ========================================================
+    # 金融
+    # ========================================================
+
+    "2881": {
+        "name": "富邦金",
+        "ticker": "2881.TW",
+    },
+
+    "2882": {
+        "name": "國泰金",
+        "ticker": "2882.TW",
+    },
+
+    "2884": {
+        "name": "玉山金",
+        "ticker": "2884.TW",
+    },
+
+    "2886": {
+        "name": "兆豐金",
+        "ticker": "2886.TW",
+    },
+
+
+    # ========================================================
+    # 航運 / 航空
+    # ========================================================
+
+    "2603": {
+        "name": "長榮",
+        "ticker": "2603.TW",
+    },
+
+    "2609": {
+        "name": "陽明",
+        "ticker": "2609.TW",
+    },
+
+    "2615": {
+        "name": "萬海",
+        "ticker": "2615.TW",
+    },
+
+    "2610": {
+        "name": "華航",
+        "ticker": "2610.TW",
+    },
+
+
+    # ========================================================
+    # 傳產 / 原物料
+    # ========================================================
+
+    "2002": {
+        "name": "中鋼",
+        "ticker": "2002.TW",
+    },
+
+    "1301": {
+        "name": "台塑",
+        "ticker": "1301.TW",
+    },
+
+    "1303": {
+        "name": "南亞",
+        "ticker": "1303.TW",
+    },
+
+
+    # ========================================================
+    # 民生 / 電信
+    # ========================================================
+
+    "1216": {
+        "name": "統一",
+        "ticker": "1216.TW",
+    },
+
+    "2412": {
+        "name": "中華電",
+        "ticker": "2412.TW",
+    },
+
+
+    # ========================================================
+    # ETF 基準
+    # ========================================================
+
+    "0050": {
+        "name": "元大台灣50",
+        "ticker": "0050.TW",
+    },
+
+    "0056": {
+        "name": "元大高股息",
+        "ticker": "0056.TW",
     },
 }
 
@@ -272,7 +365,7 @@ def yahoo_get(
                 url,
                 headers={
                     "User-Agent":
-                        "Mozilla/5.0 TW35-Monitor/1.1",
+                        "Mozilla/5.0 TW35-Monitor/1.2",
 
                     "Accept":
                         "application/json",
@@ -293,6 +386,7 @@ def yahoo_get(
             )
 
             if not result:
+
                 raise RuntimeError(
                     f"No Yahoo data: {ticker}"
                 )
@@ -451,15 +545,8 @@ def latest_trade_day_info(
     rd
 ):
 
-    """
-    回傳最近一個實際有5m資料的交易日：
-    - trade_date
-    - open_price
-    - previous_close
-    - gap_pct
-    """
-
     if not r5:
+
         return {
             "trade_date": None,
             "open_price": None,
@@ -478,6 +565,7 @@ def latest_trade_day_info(
     )
 
     if not trade_dates:
+
         return {
             "trade_date": None,
             "open_price": None,
@@ -847,7 +935,7 @@ def recent_resistance(
 
 
 # ============================================================
-# ENTRY潛力
+# ENTRY 潛力
 # ============================================================
 
 def estimate_potential(
@@ -1097,7 +1185,6 @@ def analyze(
 ):
 
     ticker = info["ticker"]
-
     name = info["name"]
 
 
@@ -1154,7 +1241,6 @@ def analyze(
     previous5 = r5[-2]
 
     latest15 = r15[-1]
-
     latest1 = r1[-1]
 
 
@@ -1224,6 +1310,10 @@ def analyze(
     )
 
 
+    # ========================================================
+    # 訊號
+    # ========================================================
+
     h1 = one_hour_trend(
         latest1
     )
@@ -1263,7 +1353,7 @@ def analyze(
 
 
     # ========================================================
-    # 台股專用風控
+    # 台股風控
     # ========================================================
 
     near_limit_up = (
@@ -1890,7 +1980,7 @@ def stage_block(s):
 
 
 # ============================================================
-# ENTRY通知
+# ENTRY 通知
 # ============================================================
 
 def send_entry(
@@ -2080,6 +2170,7 @@ def notify_status(
             f"TW35 READY {code}",
             (
                 f"{code} {r['name']}\n\n"
+
                 f"{stage_block(s)}\n\n"
 
                 f"交易日："
@@ -2097,6 +2188,7 @@ def notify_status(
                 f"1H=True\n"
                 f"15m=True\n"
                 f"5m=False\n\n"
+
                 f"等待5m ENTRY。"
             ),
             "default",
@@ -2110,6 +2202,7 @@ def notify_status(
             f"TW35 WATCH {code}",
             (
                 f"{code} {r['name']}\n\n"
+
                 f"{stage_block(s)}\n\n"
 
                 f"交易日："
@@ -2126,6 +2219,7 @@ def notify_status(
 
                 f"1H=True\n"
                 f"15m=False\n\n"
+
                 f"等待READY。"
             ),
             "default",
@@ -2145,8 +2239,12 @@ def notify_status(
                 f"TW35 INVALID {code}",
                 (
                     f"{code} {r['name']}\n\n"
+
                     f"{stage_block(s)}\n\n"
-                    f"前一狀態：{previous}\n"
+
+                    f"前一狀態："
+                    f"{previous}\n"
+
                     f"短打環境失效。"
                 ),
                 "default",
@@ -2240,7 +2338,6 @@ def send_summary(
 
 
         code = r["code"]
-
         name = r["name"]
 
 
@@ -2305,6 +2402,9 @@ def send_summary(
         f"WATCH："
         f"{join(groups['WATCH'])}\n\n"
 
+        f"監控標的："
+        f"{len(SYMBOLS)}檔\n"
+
         f"目前盤中："
         f"{market_open_now()}\n"
 
@@ -2332,7 +2432,12 @@ def send_summary(
 def main():
 
     print(
-        "TW35 Monitor | v1.1"
+        "TW35 Monitor | v1.2"
+    )
+
+    print(
+        "Cross-sector symbols:",
+        len(SYMBOLS)
     )
 
     print(
@@ -2387,17 +2492,38 @@ def main():
             print(
                 f"{code} "
                 f"{info['name']:<8} "
+
                 f"{r['status']:<10} "
-                f"price={price_text(r['price'])} "
-                f"trade_date={r['trade_date']} "
-                f"prev={price_text(r['previous_close'])} "
-                f"open={price_text(r['first_open'])} "
-                f"gap={pct_text(r['gap_pct'])} "
-                f"day={pct_text(r['day_change_pct'])} "
-                f"1H={r['1h']} "
-                f"15m={r['15m']} "
-                f"5m={r['5m']} "
-                f"allowed={r['entry_allowed']}"
+
+                f"price="
+                f"{price_text(r['price'])} "
+
+                f"trade_date="
+                f"{r['trade_date']} "
+
+                f"prev="
+                f"{price_text(r['previous_close'])} "
+
+                f"open="
+                f"{price_text(r['first_open'])} "
+
+                f"gap="
+                f"{pct_text(r['gap_pct'])} "
+
+                f"day="
+                f"{pct_text(r['day_change_pct'])} "
+
+                f"1H="
+                f"{r['1h']} "
+
+                f"15m="
+                f"{r['15m']} "
+
+                f"5m="
+                f"{r['5m']} "
+
+                f"allowed="
+                f"{r['entry_allowed']}"
             )
 
 
@@ -2463,6 +2589,11 @@ def main():
     print(
         "\nSTATUS COUNTS:",
         counts
+    )
+
+    print(
+        "SYMBOL COUNT:",
+        len(SYMBOLS)
     )
 
     print(
