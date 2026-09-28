@@ -1254,14 +1254,24 @@ def update_stage_memory(
             "ready_time"
         ] = now_iso()
 
-    # READY 一成立就鎖定 SETUP_TARGET，之後快掃不准目標往上漂。
+    # 只要 1H + 15m 已形成短打候選，就先建立並鎖定 SETUP_TARGET。
+    # READY / ENTRY 是後續狀態，不應反過來決定「有沒有目標價」。
+    target_candidate = (
+        bool(r.get("1h_trend"))
+        and bool(r.get("15m_ready"))
+    )
+
     if (
-        status in ("READY", "ENTRY_CHECK", "ENTRY")
+        (
+            status in ("WATCH", "READY", "ENTRY_CHECK", "ENTRY")
+            and target_candidate
+        )
         and symbol_state.get("setup_target_price") is None
     ):
         p = r.get("potential") or {}
-        symbol_state["setup_target_price"] = p.get("target_price")
-        symbol_state["setup_target_time"] = now_iso()
+        if p.get("target_price") is not None:
+            symbol_state["setup_target_price"] = p.get("target_price")
+            symbol_state["setup_target_time"] = now_iso()
 
     if (
         status == "ENTRY"
@@ -1922,7 +1932,9 @@ def apply_fixed_setup_target(r, state):
 
     if (
         fixed_target is None
-        and status in ("READY", "ENTRY_CHECK", "ENTRY")
+        and status in ("WATCH", "READY", "ENTRY_CHECK", "ENTRY")
+        and r.get("1h_trend")
+        and r.get("15m_ready")
     ):
         fixed_target = p.get("target_price")
         if fixed_target is not None:
