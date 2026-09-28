@@ -41,23 +41,17 @@ from zoneinfo import ZoneInfo
 # ============================================================
 
 TW_STOCKS = {
-    "0050": "0050.TW",   # 元大台灣50
-    "2330": "2330.TW",   # 台積電
-    "2317": "2317.TW",   # 鴻海
-    "2454": "2454.TW",   # 聯發科
-    "2382": "2382.TW",   # 廣達
-    "3231": "3231.TW",   # 緯創
-    "2308": "2308.TW",   # 台達電
+    "0050":"0050.TW", "2330":"2330.TW", "2317":"2317.TW", "2454":"2454.TW", "2308":"2308.TW",
+    "2881":"2881.TW", "2882":"2882.TW", "2891":"2891.TW",
+    "1216":"1216.TW", "1301":"1301.TW", "1303":"1303.TW", "2002":"2002.TW",
+    "2412":"2412.TW", "2603":"2603.TW", "1101":"1101.TW",
 }
 
 TW_NAMES = {
-    "0050": "元大台灣50",
-    "2330": "台積電",
-    "2317": "鴻海",
-    "2454": "聯發科",
-    "2382": "廣達",
-    "3231": "緯創",
-    "2308": "台達電",
+    "0050":"元大台灣50", "2330":"台積電", "2317":"鴻海", "2454":"聯發科", "2308":"台達電",
+    "2881":"富邦金", "2882":"國泰金", "2891":"中信金",
+    "1216":"統一", "1301":"台塑", "1303":"南亞", "2002":"中鋼",
+    "2412":"中華電", "2603":"長榮", "1101":"台泥",
 }
 
 
@@ -71,6 +65,19 @@ FIVE_M = 5 * 60
 
 MIN_READY_SPACE_PCT = 2.5
 MIN_ENTRY_SPACE_PCT = 2.0
+# 台股成本預設採保守上限，可由環境變數改成你的券商實際折扣。
+TW_COMMISSION_RATE = float(os.getenv("TW35_COMMISSION_RATE", "0.001425"))
+TW_STOCK_SELL_TAX = float(os.getenv("TW35_STOCK_SELL_TAX", "0.003"))
+TW_ETF_SELL_TAX = float(os.getenv("TW35_ETF_SELL_TAX", "0.001"))
+
+def tw_sell_tax(code):
+    return TW_ETF_SELL_TAX if code == "0050" else TW_STOCK_SELL_TAX
+
+def tw_net_exit_price(entry, code, desired_net_pct):
+    if not entry or entry <= 0: return None
+    buy_cost = entry * (1 + TW_COMMISSION_RATE)
+    sell_deduct = TW_COMMISSION_RATE + tw_sell_tax(code)
+    return buy_cost * (1 + desired_net_pct/100.0) / (1 - sell_deduct)
 
 FAST_SCAN_SECONDS = 60
 FAST_SCAN_ROUNDS = 5
@@ -415,6 +422,11 @@ def add_indicators(rows):
 # 訊號
 # ============================================================
 
+def daily_long_allowed(r):
+    need=[r.get("ma20"),r.get("ma20_prev"),r.get("ma5"),r.get("ma10")]
+    if any(x is None for x in need): return False
+    return (r["c"] >= r["ma20"]*0.98 and r["ma20"] >= r["ma20_prev"]*0.995) or (r["c"] > r["ma20"] and r["ma5"] >= r["ma10"]*0.98)
+
 def one_hour_trend(r):
     needed = [
         r.get("ma5"),
@@ -431,13 +443,9 @@ def one_hour_trend(r):
         return False
 
     return (
-        r["c"] > r["ma20"]
-        and
-        r["ma20"] > r["ma20_prev"]
-        and
-        r["ma5"] > r["ma10"]
-        and
-        r["ma10"] > r["ma20"]
+        r["c"] >= r["ma20"] * 0.990
+        and r["ma20"] >= r["ma20_prev"] * 0.995
+        and r["ma5"] >= r["ma10"] * 0.985
     )
 
 
@@ -726,6 +734,8 @@ def analyze(code, yahoo_symbol):
         ).timestamp()
     )
 
+    r1d = completed_only(fetch(yahoo_symbol, "1d", "1y"), ONE_D, now_ts)
+
     # Yahoo intraday 支援的範圍不同，所以分開抓
     r1 = completed_only(
         fetch(
@@ -756,7 +766,8 @@ def analyze(code, yahoo_symbol):
     )
 
     if (
-        len(r1) < 65
+        len(r1d) < 30
+        or len(r1) < 65
         or len(r15) < 65
         or len(r5) < 65
     ):
@@ -767,10 +778,12 @@ def analyze(code, yahoo_symbol):
             "status": "WAIT_HISTORY",
         }
 
+    add_indicators(r1d)
     add_indicators(r1)
     add_indicators(r15)
     add_indicators(r5)
 
+    latest1d = r1d[-1]
     latest1 = r1[-1]
     latest15 = r15[-1]
     latest5 = r5[-1]
@@ -793,6 +806,7 @@ def analyze(code, yahoo_symbol):
             "price": latest5["c"],
         }
 
+    d1_allowed = daily_long_allowed(latest1d)
     h1 = one_hour_trend(latest1)
     m15 = fifteen_min_ready(latest15)
     m5 = five_min_entry(
@@ -806,7 +820,8 @@ def analyze(code, yahoo_symbol):
     amount_1h = rolling_1h_amount(r5)
 
     if (
-        h1
+        d1_allowed
+        and h1
         and m15
     ):
         potential = estimate_potential(
@@ -817,6 +832,12 @@ def analyze(code, yahoo_symbol):
 
         potential["amount_5m"] = amount_5m
         potential["amount_1h"] = amount_1h
+        ep = potential.get("entry_price") or latest5["c"]
+        potential["breakeven_after_cost"] = tw_net_exit_price(ep, code, 0.0)
+        potential["net_tp3"] = tw_net_exit_price(ep, code, 3.0)
+        potential["net_tp5"] = tw_net_exit_price(ep, code, 5.0)
+        potential["commission_rate"] = TW_COMMISSION_RATE
+        potential["sell_tax_rate"] = tw_sell_tax(code)
 
         current_space = potential.get(
             "potential_pct"
@@ -842,7 +863,7 @@ def analyze(code, yahoo_symbol):
         else:
             status = "WATCH"
 
-    elif h1:
+    elif d1_allowed:
         status = "WATCH"
 
     else:
@@ -853,6 +874,7 @@ def analyze(code, yahoo_symbol):
         "name": TW_NAMES.get(code, code),
         "symbol": yahoo_symbol,
         "status": status,
+        "1d_long_allowed": d1_allowed,
         "price": latest5["c"],
         "price_1h": latest1["c"],
         "price_15m": latest15["c"],
@@ -1346,6 +1368,11 @@ def send_entry(
 
         f"TP2："
         f"{price_text(p.get('tp2'))}\n"
+        f"含成本損益兩平：{price_text(p.get('breakeven_after_cost'))}\n"
+        f"淨利3%出場價：{price_text(p.get('net_tp3'))}\n"
+        f"淨利5%出場價：{price_text(p.get('net_tp5'))}\n"
+        f"買入/賣出手續費率：{p.get('commission_rate', 0)*100:.4f}% / 邊\n"
+        f"賣出證交稅率：{p.get('sell_tax_rate', 0)*100:.3f}%\n"
 
         f"最近壓力："
         f"{price_text(p.get('resistance'))}\n"
