@@ -94,3 +94,2197 @@ TW_NAMES = {
     "2912": "統一超",
     "2207": "和泰車",
     "6446": "藥華藥",
+}
+
+
+# ============================================================
+# 參數
+# ============================================================
+
+ONE_D = 24 * 60 * 60
+ONE_H = 60 * 60
+FIFTEEN_M = 15 * 60
+FIVE_M = 5 * 60
+
+# 台股交易成本（可由 GitHub Actions env 覆寫）
+TW_BROKER_FEE_RATE = float(os.getenv("TW35_BROKER_FEE_RATE", "0.001425"))
+TW_STOCK_TAX_RATE = float(os.getenv("TW35_STOCK_TAX_RATE", "0.003"))
+TW_ETF_TAX_RATE = float(os.getenv("TW35_ETF_TAX_RATE", "0.001"))
+
+TW_ETF_CODES = {"0050"}  # 其餘皆以個股證交稅計算
+
+MIN_READY_SPACE_PCT = 2.5
+MIN_ENTRY_SPACE_PCT = 2.0
+
+FAST_SCAN_SECONDS = 60
+FAST_SCAN_ROUNDS = 5
+
+SUMMARY_INTERVAL = 30 * 60
+
+TW_TZ = ZoneInfo("Asia/Taipei")
+TW_OPEN = dt_time(9, 0)
+TW_CLOSE = dt_time(13, 30)
+
+STATE_DIR = Path(".tw35_state")
+STATE_FILE = STATE_DIR / "state.json"
+
+
+# ============================================================
+# ntfy
+# ============================================================
+
+NTFY_SERVER = os.getenv(
+    "NTFY_SERVER",
+    "https://ntfy.sh"
+).rstrip("/")
+
+# 優先使用台股專用 topic；沒設時可沿用原 35 topic
+NTFY_TOPIC = (
+    os.getenv("NTFY_TOPIC_TW35", "").strip()
+    or os.getenv("NTFY_TOPIC_SHORT35", "").strip()
+)
+
+GITHUB_EVENT_NAME = os.getenv(
+    "GITHUB_EVENT_NAME",
+    ""
+).strip()
+
+MANUAL_RUN = (
+    GITHUB_EVENT_NAME == "workflow_dispatch"
+)
+
+
+# ============================================================
+# 基礎工具
+# ============================================================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def price_text(v):
+    if v is None:
+        return "N/A"
+    if abs(v) >= 100:
+        return f"{v:.2f}"
+    if abs(v) >= 10:
+        return f"{v:.3f}"
+    if abs(v) >= 1:
+        return f"{v:.4f}"
+    return f"{v:.6f}"
+
+
+def pct_text(v):
+    if v is None:
+        return "N/A"
+    return f"{v:+.2f}%"
+
+
+def money_twd(v):
+    if v is None:
+        return "N/A"
+    v = float(v)
+    if abs(v) >= 100_000_000:
+        return f"{v / 100_000_000:.2f} 億"
+    if abs(v) >= 10_000:
+        return f"{v / 10_000:.2f} 萬"
+    return f"{v:,.0f}"
+
+
+def pct_change(base_price, current_price):
+    if (
+        base_price is None
+        or current_price is None
+        or base_price <= 0
+    ):
+        return None
+
+    return (
+        current_price
+        / base_price
+        - 1
+    ) * 100
+
+
+
+def tw_sell_tax_rate(code):
+    return TW_ETF_TAX_RATE if str(code) in TW_ETF_CODES else TW_STOCK_TAX_RATE
+
+
+def tw_net_exit_price(entry_price, code, desired_net_pct):
+    """扣除買入手續費、賣出手續費、證交稅後，達成指定淨報酬的賣出價。"""
+    if entry_price is None or entry_price <= 0:
+        return None
+
+    buy_cost = entry_price * (1.0 + TW_BROKER_FEE_RATE)
+    sell_deduction = (
+        TW_BROKER_FEE_RATE
+        + tw_sell_tax_rate(code)
+    )
+    desired = desired_net_pct / 100.0
+
+    return (
+        buy_cost * (1.0 + desired)
+        / (1.0 - sell_deduction)
+    )
+
+
+def tw_market_open(now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    tw_now = now_utc.astimezone(TW_TZ)
+
+    if tw_now.weekday() >= 5:
+        return False
+
+    t = tw_now.time().replace(tzinfo=None)
+
+    return (
+        TW_OPEN <= t < TW_CLOSE
+    )
+
+
+def tw_trade_date(now_utc=None):
+    now_utc = now_utc or datetime.now(timezone.utc)
+    return now_utc.astimezone(TW_TZ).date().isoformat()
+
+
+# ============================================================
+# Yahoo Finance Chart API
+# ============================================================
+
+YAHOO_HOSTS = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+]
+
+
+def yahoo_get(symbol, interval, range_text, retries=4):
+    params = urllib.parse.urlencode({
+        "interval": interval,
+        "range": range_text,
+        "includePrePost": "false",
+        "events": "div,splits",
+    })
+
+    last_error = None
+
+    for attempt in range(retries):
+        host = YAHOO_HOSTS[attempt % len(YAHOO_HOSTS)]
+        url = (
+            f"{host}/v8/finance/chart/"
+            f"{urllib.parse.quote(symbol)}?{params}"
+        )
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                    ),
+                }
+            )
+
+            with urllib.request.urlopen(
+                req,
+                timeout=25
+            ) as resp:
+                data = json.load(resp)
+
+            result = (
+                data
+                .get("chart", {})
+                .get("result")
+            )
+
+            if not result:
+                err = data.get("chart", {}).get("error")
+                raise RuntimeError(
+                    f"Yahoo no result: {err}"
+                )
+
+            return result[0]
+
+        except Exception as e:
+            last_error = e
+            time.sleep(min(2 ** attempt, 6))
+
+    raise RuntimeError(
+        f"Yahoo request failed: {last_error}"
+    )
+
+
+def fetch(symbol, interval, range_text):
+    data = yahoo_get(
+        symbol,
+        interval,
+        range_text
+    )
+
+    timestamps = data.get("timestamp") or []
+
+    indicators = data.get(
+        "indicators",
+        {}
+    )
+
+    quotes = (
+        indicators.get("quote")
+        or [{}]
+    )[0]
+
+    opens = quotes.get("open") or []
+    highs = quotes.get("high") or []
+    lows = quotes.get("low") or []
+    closes = quotes.get("close") or []
+    volumes = quotes.get("volume") or []
+
+    rows = []
+
+    for i, ts in enumerate(timestamps):
+        try:
+            o = opens[i]
+            h = highs[i]
+            l = lows[i]
+            c = closes[i]
+            v = volumes[i]
+        except IndexError:
+            continue
+
+        if (
+            o is None
+            or h is None
+            or l is None
+            or c is None
+        ):
+            continue
+
+        volume = float(v or 0)
+        close = float(c)
+
+        rows.append({
+            "t": int(ts),
+            "o": float(o),
+            "h": float(h),
+            "l": float(l),
+            "c": close,
+            "v": volume,
+
+            # 台股現貨成交額估算：股數 x 價格
+            "amount": abs(volume * close),
+        })
+
+    rows.sort(
+        key=lambda x: x["t"]
+    )
+
+    return rows
+
+
+def completed_only(rows, step, now_ts):
+    return [
+        r
+        for r in rows
+        if r["t"] + step <= now_ts
+    ]
+
+
+def data_is_fresh(rows, max_age_seconds):
+    if not rows:
+        return False
+
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    latest_t = rows[-1]["t"]
+
+    return (
+        now_ts - latest_t
+        <= max_age_seconds
+    )
+
+
+# ============================================================
+# 指標
+# ============================================================
+
+def sma(values, n, i):
+    if i + 1 < n:
+        return None
+
+    return sum(
+        values[i - n + 1:i + 1]
+    ) / n
+
+
+def true_range(current, previous):
+    if previous is None:
+        return current["h"] - current["l"]
+
+    return max(
+        current["h"] - current["l"],
+        abs(current["h"] - previous["c"]),
+        abs(current["l"] - previous["c"]),
+    )
+
+
+def add_indicators(rows):
+    closes = [
+        r["c"]
+        for r in rows
+    ]
+
+    volumes = [
+        r["v"]
+        for r in rows
+    ]
+
+    trs = []
+
+    for i, r in enumerate(rows):
+        previous = (
+            rows[i - 1]
+            if i > 0
+            else None
+        )
+
+        trs.append(
+            true_range(
+                r,
+                previous
+            )
+        )
+
+    for i, r in enumerate(rows):
+        r["ma5"] = sma(closes, 5, i)
+        r["ma10"] = sma(closes, 10, i)
+        r["ma20"] = sma(closes, 20, i)
+        r["ma25"] = sma(closes, 25, i)
+        r["ma60"] = sma(closes, 60, i)
+
+        r["ma25_prev"] = (
+            sma(closes, 25, i - 1)
+            if i >= 25
+            else None
+        )
+
+        r["ma20_prev"] = (
+            sma(closes, 20, i - 1)
+            if i >= 20
+            else None
+        )
+
+        r["vma5"] = sma(volumes, 5, i)
+        r["vma20"] = sma(volumes, 20, i)
+        r["vma60"] = sma(volumes, 60, i)
+
+        r["vma5_prev"] = (
+            sma(volumes, 5, i - 1)
+            if i >= 5
+            else None
+        )
+
+        r["vma60_prev"] = (
+            sma(volumes, 60, i - 1)
+            if i >= 60
+            else None
+        )
+
+        r["atr14"] = sma(trs, 14, i)
+
+
+
+# ============================================================
+# 內建 TW2560 上級趨勢
+# 日K = 戰略；1H = 波段；15m = 進場
+# ============================================================
+
+def tw2560_daily_strategy(r):
+    need = [
+        r.get("ma25"),
+        r.get("ma25_prev"),
+        r.get("vma5"),
+        r.get("vma60"),
+    ]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["c"] >= r["ma25"] * 0.985
+        and r["ma25"] >= r["ma25_prev"]
+        and r["vma5"] >= r["vma60"] * 0.90
+    )
+
+
+def tw2560_hour_wave(r):
+    need = [
+        r.get("ma25"),
+        r.get("ma25_prev"),
+        r.get("vma5"),
+        r.get("vma60"),
+        r.get("vma5_prev"),
+    ]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["c"] >= r["ma25"] * 0.995
+        and r["ma25"] >= r["ma25_prev"] * 0.995
+        and (
+            r["vma5"] >= r["vma60"] * 0.90
+            or r["vma5"] > r["vma5_prev"] * 1.02
+        )
+    )
+
+
+def tw2560_15m_entry(r):
+    need = [
+        r.get("ma5"),
+        r.get("ma10"),
+        r.get("ma20"),
+        r.get("vma5"),
+        r.get("vma20"),
+    ]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["c"] >= r["ma20"] * 0.992
+        and r["ma5"] >= r["ma10"] * 0.985
+        and r["vma5"] >= r["vma20"] * 0.90
+    )
+
+
+def embedded_tw2560_status(r1d, r1, r15):
+    strategic = tw2560_daily_strategy(r1d[-1])
+    wave = tw2560_hour_wave(r1[-1])
+    timing = tw2560_15m_entry(r15[-1])
+
+    if strategic and wave and timing:
+        status = "STRICT"
+    elif strategic and wave:
+        status = "PRE-STRICT"
+    elif strategic:
+        status = "TREND_READY"
+    elif wave:
+        status = "WATCH"
+    else:
+        status = "NO_SIGNAL"
+
+    return {
+        "status": status,
+        "1d_strategy": strategic,
+        "1h_wave": wave,
+        "15m_entry": timing,
+    }
+
+
+def apply_tw2560_filter(r):
+    status = r.get("tw2560_status", "N/A")
+    daily_ok = r.get("tw2560_daily_ok")
+
+    if status in ("TREND_READY", "PRE-STRICT", "STRICT"):
+        r["tw2560_bias"] = "POSITIVE"
+    elif status == "WATCH":
+        r["tw2560_bias"] = "NEUTRAL_POSITIVE"
+    elif status == "NO_SIGNAL" and daily_ok is False:
+        r["tw2560_bias"] = "NEGATIVE"
+        if r.get("status") == "ENTRY":
+            r["status"] = "ENTRY_CHECK"
+        elif r.get("status") == "READY":
+            r["status"] = "WATCH"
+    else:
+        r["tw2560_bias"] = "NEUTRAL"
+
+    return r
+
+
+# ============================================================
+# 訊號
+# ============================================================
+
+def one_hour_trend(r):
+    needed = [
+        r.get("ma5"),
+        r.get("ma10"),
+        r.get("ma20"),
+        r.get("ma60"),
+        r.get("ma20_prev"),
+    ]
+
+    if any(
+        x is None
+        for x in needed
+    ):
+        return False
+
+    return (
+        r["c"] > r["ma20"]
+        and
+        r["ma20"] > r["ma20_prev"]
+        and
+        r["ma5"] > r["ma10"]
+        and
+        r["ma10"] > r["ma20"]
+    )
+
+
+def fifteen_min_ready(r):
+    needed = [
+        r.get("ma5"),
+        r.get("ma10"),
+        r.get("ma20"),
+    ]
+
+    if any(
+        x is None
+        for x in needed
+    ):
+        return False
+
+    return (
+        r["c"] >= r["ma20"] * 0.995
+        and
+        r["ma5"] >= r["ma10"] * 0.995
+    )
+
+
+def five_min_entry(current, previous):
+    needed = [
+        current.get("ma5"),
+        current.get("ma10"),
+        current.get("ma20"),
+        current.get("vma5"),
+        current.get("vma20"),
+        previous.get("ma5"),
+        previous.get("ma10"),
+    ]
+
+    if any(
+        x is None
+        for x in needed
+    ):
+        return False
+
+    cross_up = (
+        current["ma5"] > current["ma10"]
+        and
+        previous["ma5"] <= previous["ma10"]
+    )
+
+    already_strong = (
+        current["ma5"] > current["ma10"]
+        and
+        current["c"] > current["ma20"]
+    )
+
+    volume_ok = (
+        current["vma5"] > current["vma20"]
+    )
+
+    return (
+        (
+            cross_up
+            or already_strong
+        )
+        and volume_ok
+    )
+
+
+# ============================================================
+# 目標 / 空間
+# ============================================================
+
+def recent_resistance(current_price, r1, r15):
+    candidates = []
+
+    for r in r1[-40:]:
+        if r["h"] > current_price:
+            candidates.append(r["h"])
+
+    for r in r15[-80:]:
+        if r["h"] > current_price:
+            candidates.append(r["h"])
+
+    if not candidates:
+        return None
+
+    return min(candidates)
+
+
+def estimate_potential(
+    r1,
+    r15,
+    latest5
+):
+    latest1 = r1[-1]
+    entry_price = latest5["c"]
+
+    resistance = recent_resistance(
+        entry_price,
+        r1,
+        r15
+    )
+
+    atr = latest1.get("atr14")
+
+    atr_pct = None
+
+    if (
+        atr is not None
+        and entry_price > 0
+    ):
+        atr_pct = (
+            atr
+            / entry_price
+            * 100
+        )
+
+    resistance_pct = None
+
+    if (
+        resistance is not None
+        and resistance > entry_price
+    ):
+        resistance_pct = (
+            resistance
+            / entry_price
+            - 1
+        ) * 100
+
+    atr_target_pct = (
+        atr_pct * 2.0
+        if atr_pct is not None
+        else None
+    )
+
+    volume_ratio = None
+
+    if (
+        latest5.get("vma5")
+        and latest5.get("vma20")
+    ):
+        volume_ratio = (
+            latest5["vma5"]
+            / latest5["vma20"]
+        )
+
+    trend_bonus = 0.0
+
+    if (
+        latest1.get("ma5") is not None
+        and latest1.get("ma10") is not None
+        and latest1.get("ma20") is not None
+        and latest1["ma5"]
+        > latest1["ma10"]
+        > latest1["ma20"]
+    ):
+        trend_bonus += 0.5
+
+    if volume_ratio is not None:
+        if volume_ratio >= 1.5:
+            trend_bonus += 0.8
+        elif volume_ratio >= 1.2:
+            trend_bonus += 0.4
+
+    candidates = []
+
+    if resistance_pct is not None:
+        candidates.append(
+            resistance_pct
+        )
+
+    if atr_target_pct is not None:
+        candidates.append(
+            atr_target_pct
+        )
+
+    if candidates:
+        base_potential = min(
+            candidates
+        )
+    else:
+        base_potential = 3.0
+
+    potential_pct = max(
+        0.5,
+        base_potential + trend_bonus
+    )
+
+    # 35 策略只關注 3~5% 級距，不做過度樂觀延伸
+    potential_pct = min(
+        potential_pct,
+        5.0
+    )
+
+    # 台股單日價格限制保護：
+    # 目標不可超過「目前價 + 9.5%」的安全上限。
+    potential_pct = min(
+        potential_pct,
+        9.5
+    )
+
+    target_price = (
+        entry_price
+        * (
+            1 + potential_pct / 100
+        )
+    )
+
+    tp1_pct = min(
+        potential_pct * 0.60,
+        3.0
+    )
+
+    tp2_pct = min(
+        potential_pct,
+        5.0
+    )
+
+    tp1 = (
+        entry_price
+        * (
+            1 + tp1_pct / 100
+        )
+    )
+
+    tp2 = (
+        entry_price
+        * (
+            1 + tp2_pct / 100
+        )
+    )
+
+    if potential_pct >= 4.5:
+        grade = "HIGH"
+    elif potential_pct >= 3.0:
+        grade = "OK"
+    else:
+        grade = "LOW"
+
+    support_candidates = [
+        x["l"]
+        for x in (r1[-40:] + r15[-80:])
+        if x.get("l") is not None and x["l"] < entry_price
+    ]
+
+    return {
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "potential_pct": potential_pct,
+        "grade": grade,
+        "resistance": resistance,
+        "resistance_pct": resistance_pct,
+        "support": max(support_candidates) if support_candidates else None,
+        "atr_pct": atr_pct,
+        "tp1": tp1,
+        "tp2": tp2,
+        "volume_ratio": volume_ratio,
+    }
+
+
+# ============================================================
+# 流量
+# ============================================================
+
+def current_5m_amount(r5):
+    if not r5:
+        return None
+    return r5[-1].get("amount")
+
+
+def rolling_1h_amount(r5):
+    if not r5:
+        return None
+
+    values = [
+        r.get("amount")
+        for r in r5[-12:]
+        if r.get("amount") is not None
+    ]
+
+    return (
+        sum(values)
+        if values
+        else None
+    )
+
+
+# ============================================================
+# 單一股票分析
+# ============================================================
+
+def analyze(code, yahoo_symbol):
+    now_ts = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
+
+    # 日K負責 TW2560 戰略方向
+    r1d = completed_only(
+        fetch(
+            yahoo_symbol,
+            "1d",
+            "1y"
+        ),
+        ONE_D,
+        now_ts
+    )
+
+    # Yahoo intraday 支援的範圍不同，所以分開抓
+    r1 = completed_only(
+        fetch(
+            yahoo_symbol,
+            "60m",
+            "3mo"
+        ),
+        ONE_H,
+        now_ts
+    )
+
+    r15 = completed_only(
+        fetch(
+            yahoo_symbol,
+            "15m",
+            "60d"
+        ),
+        FIFTEEN_M,
+        now_ts
+    )
+
+    # 5m 保留最新正在形成中的 K 棒，
+    # READY 快掃時可在第 1~4 分鐘提前抓到 ENTRY。
+    r5 = fetch(
+        yahoo_symbol,
+        "5m",
+        "10d"
+    )
+
+    if (
+        len(r1d) < 65
+        or len(r1) < 65
+        or len(r15) < 65
+        or len(r5) < 65
+    ):
+        return {
+            "code": code,
+            "name": TW_NAMES.get(code, code),
+            "symbol": yahoo_symbol,
+            "status": "WAIT_HISTORY",
+        }
+
+    add_indicators(r1d)
+    add_indicators(r1)
+    add_indicators(r15)
+    add_indicators(r5)
+
+    latest1d = r1d[-1]
+    latest1 = r1[-1]
+    latest15 = r15[-1]
+    latest5 = r5[-1]
+    prev5 = r5[-2]
+
+    # 台股開盤期間，最新 5m 資料若超過 20 分鐘沒更新，
+    # 視為假日 / API 延遲 / 無新成交，不發訊號。
+    if (
+        tw_market_open()
+        and not data_is_fresh(
+            r5,
+            20 * 60
+        )
+    ):
+        return {
+            "code": code,
+            "name": TW_NAMES.get(code, code),
+            "symbol": yahoo_symbol,
+            "status": "STALE_DATA",
+            "price": latest5["c"],
+        }
+
+    h1 = one_hour_trend(latest1)
+    m15 = fifteen_min_ready(latest15)
+    m5 = five_min_entry(
+        latest5,
+        prev5
+    )
+
+    potential = None
+
+    amount_5m = current_5m_amount(r5)
+    amount_1h = rolling_1h_amount(r5)
+
+    if (
+        h1
+        and m15
+    ):
+        potential = estimate_potential(
+            r1,
+            r15,
+            latest5
+        )
+
+        potential["amount_5m"] = amount_5m
+        potential["amount_1h"] = amount_1h
+
+        current_space = potential.get(
+            "potential_pct"
+        )
+
+        if m5:
+            if (
+                current_space is not None
+                and current_space
+                >= MIN_ENTRY_SPACE_PCT
+            ):
+                status = "ENTRY"
+            else:
+                status = "ENTRY_CHECK"
+
+        elif (
+            current_space is not None
+            and current_space
+            >= MIN_READY_SPACE_PCT
+        ):
+            status = "READY"
+
+        else:
+            status = "WATCH"
+
+    elif h1:
+        status = "WATCH"
+
+    else:
+        status = "NO_SIGNAL"
+
+    tw2560 = embedded_tw2560_status(
+        r1d,
+        r1,
+        r15
+    )
+
+    result = {
+        "code": code,
+        "name": TW_NAMES.get(code, code),
+        "symbol": yahoo_symbol,
+        "status": status,
+        "price": latest5["c"],
+        "price_1h": latest1["c"],
+        "price_15m": latest15["c"],
+        "price_5m": latest5["c"],
+        "1h_trend": h1,
+        "15m_ready": m15,
+        "5m_entry": m5,
+        "potential": potential,
+        "amount_5m": amount_5m,
+        "amount_1h": amount_1h,
+        "tw2560_status": tw2560["status"],
+        "tw2560_daily_ok": tw2560["1d_strategy"],
+        "tw2560_detail": tw2560,
+    }
+
+    return apply_tw2560_filter(result)
+
+
+# ============================================================
+# ntfy
+# ============================================================
+
+def send_ntfy(
+    title,
+    msg,
+    priority="default",
+    tags="bell"
+):
+    if not NTFY_TOPIC:
+        print("NTFY_TOPIC_TW35 / NTFY_TOPIC_SHORT35 未設定")
+        return False
+
+    try:
+        safe_title = Header(str(title), "utf-8").encode()
+
+        req = urllib.request.Request(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}",
+            data=str(msg).encode("utf-8"),
+            method="POST",
+            headers={
+                "Title": safe_title,
+                "Priority": str(priority),
+                "Tags": str(tags),
+                "Content-Type": "text/plain; charset=utf-8",
+            }
+        )
+
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            print("NTFY:", resp.status, title)
+            return 200 <= resp.status < 300
+
+    except Exception as e:
+        print("NTFY WARN:", title, str(e))
+        return False
+
+
+# ============================================================
+# State
+# ============================================================
+
+def load_state():
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    if not STATE_FILE.exists():
+        return {
+            "symbols": {},
+            "last_summary_utc": None,
+        }
+
+    try:
+        with STATE_FILE.open(
+            "r",
+            encoding="utf-8"
+        ) as f:
+            state = json.load(f)
+
+        state.setdefault(
+            "symbols",
+            {}
+        )
+
+        state.setdefault(
+            "last_summary_utc",
+            None
+        )
+
+        return state
+
+    except Exception as e:
+        print(
+            "STATE LOAD ERROR:",
+            str(e)
+        )
+
+        return {
+            "symbols": {},
+            "last_summary_utc": None,
+        }
+
+
+def save_state(state):
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with STATE_FILE.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            state,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def reset_cycle(symbol_state):
+    keep = {
+        "status",
+        "updated_utc",
+        "tw_trade_date",
+    }
+
+    keys = list(
+        symbol_state.keys()
+    )
+
+    for key in keys:
+        if key not in keep:
+            symbol_state.pop(
+                key,
+                None
+            )
+
+
+def update_stage_memory(
+    r,
+    symbol_state,
+    previous
+):
+    status = r["status"]
+    price = r.get("price")
+
+    if price is not None:
+        symbol_state[
+            "current_price"
+        ] = price
+
+    symbol_state[
+        "last_seen_utc"
+    ] = now_iso()
+
+    if (
+        previous in (
+            "NO_SIGNAL",
+            "UNKNOWN",
+            "STALE_DATA",
+        )
+        and
+        status in (
+            "WATCH",
+            "READY",
+            "ENTRY_CHECK",
+            "ENTRY",
+        )
+    ):
+        reset_cycle(
+            symbol_state
+        )
+
+    if (
+        status in (
+            "WATCH",
+            "READY",
+            "ENTRY_CHECK",
+            "ENTRY",
+        )
+        and
+        symbol_state.get(
+            "watch_price"
+        )
+        is None
+    ):
+        symbol_state[
+            "watch_price"
+        ] = price
+
+        symbol_state[
+            "watch_time"
+        ] = now_iso()
+
+    if (
+        status in (
+            "READY",
+            "ENTRY_CHECK",
+            "ENTRY",
+        )
+        and
+        symbol_state.get(
+            "ready_price"
+        )
+        is None
+    ):
+        symbol_state[
+            "ready_price"
+        ] = price
+
+        symbol_state[
+            "ready_time"
+        ] = now_iso()
+
+    # 只要 1H + 15m 已形成短打候選，就先建立並鎖定 SETUP_TARGET。
+    # READY / ENTRY 是後續狀態，不應反過來決定「有沒有目標價」。
+    target_candidate = (
+        bool(r.get("1h_trend"))
+        and bool(r.get("15m_ready"))
+    )
+
+    if (
+        (
+            status in ("WATCH", "READY", "ENTRY_CHECK", "ENTRY")
+            and target_candidate
+        )
+        and symbol_state.get("setup_target_price") is None
+    ):
+        p = r.get("potential") or {}
+        if p.get("target_price") is not None:
+            symbol_state["setup_target_price"] = p.get("target_price")
+            symbol_state["setup_target_time"] = now_iso()
+
+    if (
+        status == "ENTRY"
+        and
+        symbol_state.get(
+            "entry_price"
+        )
+        is None
+    ):
+        p = (
+            r.get("potential")
+            or {}
+        )
+
+        symbol_state[
+            "entry_price"
+        ] = price
+
+        symbol_state[
+            "entry_time"
+        ] = now_iso()
+
+        symbol_state[
+            "entry_target_price"
+        ] = p.get(
+            "target_price"
+        )
+
+        symbol_state[
+            "entry_original_potential_pct"
+        ] = p.get(
+            "potential_pct"
+        )
+
+        symbol_state[
+            "entry_grade"
+        ] = p.get(
+            "grade"
+        )
+
+        symbol_state[
+            "entry_tp1"
+        ] = p.get(
+            "tp1"
+        )
+
+        symbol_state[
+            "entry_tp2"
+        ] = p.get(
+            "tp2"
+        )
+
+        symbol_state[
+            "entry_resistance"
+        ] = p.get(
+            "resistance"
+        )
+
+        symbol_state[
+            "entry_atr_pct"
+        ] = p.get(
+            "atr_pct"
+        )
+
+        symbol_state[
+            "entry_volume_ratio"
+        ] = p.get(
+            "volume_ratio"
+        )
+
+        symbol_state[
+            "entry_amount_5m"
+        ] = p.get(
+            "amount_5m"
+        )
+
+        symbol_state[
+            "entry_amount_1h"
+        ] = p.get(
+            "amount_1h"
+        )
+
+
+def stage_stats(symbol_state):
+    current = symbol_state.get(
+        "current_price"
+    )
+
+    watch_price = symbol_state.get(
+        "watch_price"
+    )
+
+    ready_price = symbol_state.get(
+        "ready_price"
+    )
+
+    entry_price = symbol_state.get(
+        "entry_price"
+    )
+
+    target_price = symbol_state.get(
+        "entry_target_price"
+    )
+
+    remaining_potential = None
+
+    if (
+        target_price is not None
+        and current is not None
+        and current > 0
+    ):
+        remaining_potential = (
+            target_price
+            / current
+            - 1
+        ) * 100
+
+    return {
+        "current_price": current,
+        "watch_price": watch_price,
+        "ready_price": ready_price,
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "watch_to_now": pct_change(
+            watch_price,
+            current
+        ),
+        "ready_to_now": pct_change(
+            ready_price,
+            current
+        ),
+        "entry_to_now": pct_change(
+            entry_price,
+            current
+        ),
+        "remaining_potential": (
+            remaining_potential
+        ),
+    }
+
+
+def build_stage_block(symbol_state):
+    s = stage_stats(
+        symbol_state
+    )
+
+    lines = []
+
+    if s["watch_price"] is not None:
+        lines.append(
+            "WATCH："
+            + price_text(
+                s["watch_price"]
+            )
+        )
+
+    if s["ready_price"] is not None:
+        lines.append(
+            "READY："
+            + price_text(
+                s["ready_price"]
+            )
+        )
+
+    if s["entry_price"] is not None:
+        lines.append(
+            "ENTRY："
+            + price_text(
+                s["entry_price"]
+            )
+        )
+
+    lines.append(
+        "目前："
+        + price_text(
+            s["current_price"]
+        )
+    )
+
+    lines.append("")
+
+    if s["watch_to_now"] is not None:
+        lines.append(
+            "WATCH→目前："
+            + pct_text(
+                s["watch_to_now"]
+            )
+        )
+
+    if s["ready_to_now"] is not None:
+        lines.append(
+            "READY→目前："
+            + pct_text(
+                s["ready_to_now"]
+            )
+        )
+
+    if s["entry_to_now"] is not None:
+        lines.append(
+            "ENTRY→目前："
+            + pct_text(
+                s["entry_to_now"]
+            )
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# 通知
+# ============================================================
+
+def send_entry(
+    r,
+    symbol_state
+):
+    p = (
+        r.get("potential")
+        or {}
+    )
+
+    stats = stage_stats(
+        symbol_state
+    )
+
+    volume_ratio = p.get(
+        "volume_ratio"
+    )
+
+    volume_ratio_text = (
+        f"{volume_ratio:.2f}x"
+        if volume_ratio is not None
+        else "N/A"
+    )
+
+    msg = (
+        f"股票：{r['code']} {r['name']}\n"
+        f"資料代號：{r['symbol']}\n"
+        f"{build_tw2560_notify_block(r)}\n"
+
+        f"{build_stage_block(symbol_state)}\n\n"
+
+        f"✅ 1H=True\n"
+        f"✅ 15m=True\n"
+        f"✅ 5m=True\n"
+        f"✅ 正式 ENTRY 空間 ≥"
+        f"{MIN_ENTRY_SPACE_PCT:.1f}%\n\n"
+
+        f"預估目標："
+        f"{price_text(p.get('target_price'))}\n"
+
+        f"剩餘預估空間："
+        f"{pct_text(p.get('potential_pct'))}\n"
+
+        f"潛力等級："
+        f"{p.get('grade', 'N/A')}\n\n"
+
+        f"TP1："
+        f"{price_text(p.get('tp1'))}\n"
+
+        f"TP2："
+        f"{price_text(p.get('tp2'))}\n"
+
+        f"損益兩平："
+        f"{price_text(r.get('breakeven_price'))}\n"
+
+        f"淨3%出場："
+        f"{price_text(r.get('net_tp3_price'))}\n"
+
+        f"淨5%出場："
+        f"{price_text(r.get('net_tp5_price'))}\n"
+
+        f"最近支撐："
+        f"{price_text(p.get('support'))}\n"
+
+        f"最近壓力："
+        f"{price_text(p.get('resistance'))}\n"
+
+        f"1H ATR："
+        f"{pct_text(p.get('atr_pct'))}\n\n"
+
+        f"5m成交額：約 NT$"
+        f"{money_twd(p.get('amount_5m'))}\n"
+
+        f"近1H成交額：約 NT$"
+        f"{money_twd(p.get('amount_1h'))}\n"
+
+        f"5m量能比："
+        f"{volume_ratio_text}\n\n"
+
+        f"程式只發訊號，不自動下單。\n"
+        f"請人工複核後決定是否進場。"
+    )
+
+    send_ntfy(
+        f"台股 3-5% ENTRY {r['code']}",
+        msg,
+        "high",
+        "chart_with_upwards_trend,bell"
+    )
+
+
+def notify_status(
+    r,
+    state
+):
+    code = r["code"]
+    status = r["status"]
+
+    symbol_state = (
+        state
+        .setdefault(
+            "symbols",
+            {}
+        )
+        .setdefault(
+            code,
+            {}
+        )
+    )
+
+    previous = symbol_state.get(
+        "status",
+        "UNKNOWN"
+    )
+
+    # 每個台股交易日重新建立訊號週期
+    today = tw_trade_date()
+
+    if (
+        symbol_state.get(
+            "tw_trade_date"
+        )
+        != today
+    ):
+        reset_cycle(
+            symbol_state
+        )
+
+        symbol_state[
+            "status"
+        ] = "UNKNOWN"
+
+        symbol_state[
+            "tw_trade_date"
+        ] = today
+
+        previous = "UNKNOWN"
+
+    print(
+        f"{code}: "
+        f"{previous} -> {status}"
+    )
+
+    update_stage_memory(
+        r,
+        symbol_state,
+        previous
+    )
+
+    if status == previous:
+        return
+
+    if status == "ENTRY":
+        send_entry(
+            r,
+            symbol_state
+        )
+
+    elif status == "ENTRY_CHECK":
+        p = (
+            r.get("potential")
+            or {}
+        )
+
+        send_ntfy(
+            f"台股 3-5% ENTRY CHECK {code}",
+            (
+                f"股票：{code} "
+                f"{r['name']}\n"
+                f"{build_tw2560_notify_block(r)}\n"
+
+                f"{build_stage_block(symbol_state)}\n\n"
+
+                f"1H=True\n"
+                f"15m=True\n"
+                f"5m=True\n\n"
+
+                f"5m 已達標，但目前預估空間："
+                f"{pct_text(p.get('potential_pct'))}\n"
+
+                f"正式 ENTRY 最低要求："
+                f"+{MIN_ENTRY_SPACE_PCT:.2f}%\n\n"
+
+                f"5m成交額：約 NT$"
+                f"{money_twd(p.get('amount_5m'))}\n"
+
+                f"近1H成交額：約 NT$"
+                f"{money_twd(p.get('amount_1h'))}\n\n"
+
+                f"目前不列正式 ENTRY，繼續追蹤。"
+            ),
+            "default",
+            "eyes"
+        )
+
+    elif status == "READY":
+        p = (
+            r.get("potential")
+            or {}
+        )
+
+        send_ntfy(
+            f"台股 3-5% READY {code}",
+            (
+                f"股票：{code} "
+                f"{r['name']}\n"
+                f"{build_tw2560_notify_block(r)}\n"
+
+                f"{build_stage_block(symbol_state)}\n\n"
+
+                f"1H=True\n"
+                f"15m=True\n"
+                f"5m=False\n\n"
+
+                f"目前預估目標："
+                f"{price_text(p.get('target_price'))}\n"
+
+                f"目前預估空間："
+                f"{pct_text(p.get('potential_pct'))}\n"
+
+                f"READY 最低要求："
+                f"+{MIN_READY_SPACE_PCT:.2f}%\n\n"
+
+                f"✅ 空間足夠，進入 1 分鐘快掃。\n"
+                f"5m 達標後會重新估算，"
+                f"剩餘空間 ≥"
+                f"{MIN_ENTRY_SPACE_PCT:.1f}% "
+                f"才發正式 ENTRY。"
+            ),
+            "default",
+            "eyes"
+        )
+
+    elif status == "WATCH":
+        p = (
+            r.get("potential")
+            or {}
+        )
+
+        if r.get(
+            "15m_ready"
+        ):
+            detail = (
+                f"1H=True\n"
+                f"15m=True\n"
+                f"5m=False\n\n"
+
+                f"目前預估目標："
+                f"{price_text(p.get('target_price'))}\n"
+
+                f"目前預估空間："
+                f"{pct_text(p.get('potential_pct'))}\n"
+
+                f"READY 最低要求："
+                f"+{MIN_READY_SPACE_PCT:.2f}%\n\n"
+
+                f"⚠️ 空間不足，暫不進入快掃。\n"
+                f"等待價格或上方空間改善。"
+            )
+        else:
+            detail = (
+                f"1H=True\n"
+                f"15m=False\n"
+                f"5m=False\n\n"
+                f"等待 15m READY。"
+            )
+
+        send_ntfy(
+            f"台股 3-5% WATCH {code}",
+            (
+                f"股票：{code} "
+                f"{r['name']}\n"
+                f"{build_tw2560_notify_block(r)}\n"
+                f"{build_stage_block(symbol_state)}\n\n"
+                f"{detail}"
+            ),
+            "default",
+            "eyes"
+        )
+
+    elif status == "NO_SIGNAL":
+        if previous in (
+            "WATCH",
+            "READY",
+            "ENTRY_CHECK",
+            "ENTRY",
+        ):
+            send_ntfy(
+                f"台股 3-5% invalid {code}",
+                (
+                    f"股票：{code} "
+                    f"{r['name']}\n\n"
+                    f"{build_stage_block(symbol_state)}\n\n"
+                    f"前一狀態：{previous}\n"
+                    f"目前短打環境失效。\n"
+                    f"暫停做多。"
+                ),
+                "default",
+                "warning"
+            )
+
+    symbol_state[
+        "status"
+    ] = status
+
+    symbol_state[
+        "updated_utc"
+    ] = now_iso()
+
+
+# ============================================================
+# 摘要
+# ============================================================
+
+def summary_due(
+    state,
+    force=False
+):
+    if force:
+        return True
+
+    last = state.get(
+        "last_summary_utc"
+    )
+
+    if not last:
+        return True
+
+    try:
+        last_dt = datetime.fromisoformat(
+            last
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        return (
+            now - last_dt
+        ).total_seconds() >= SUMMARY_INTERVAL
+
+    except Exception:
+        return True
+
+
+def send_summary(
+    results,
+    state,
+    error_count,
+    force=False
+):
+    if not summary_due(
+        state,
+        force=force
+    ):
+        return
+
+    buckets = {
+        "ENTRY": [],
+        "ENTRY_CHECK": [],
+        "READY": [],
+        "WATCH": [],
+    }
+
+    for r in results:
+        status = r.get("status")
+
+        if status in buckets:
+            label = (
+                f"{r['code']} "
+                f"{r['name']}"
+            )
+
+            p = r.get("potential") or {}
+
+            if (
+                status in (
+                    "ENTRY",
+                    "ENTRY_CHECK",
+                    "READY",
+                )
+                and
+                p.get("potential_pct")
+                is not None
+            ):
+                label += (
+                    f"({p['potential_pct']:+.1f}%)"
+                )
+
+            buckets[
+                status
+            ].append(
+                label
+            )
+
+    def show(items):
+        return (
+            "、".join(items)
+            if items
+            else "無"
+        )
+
+    message = (
+        f"[TW-STOCK]\n"
+        f"ENTRY："
+        f"{show(buckets['ENTRY'])}\n"
+        f"ENTRY_CHECK："
+        f"{show(buckets['ENTRY_CHECK'])}\n"
+        f"READY："
+        f"{show(buckets['READY'])}\n"
+        f"WATCH："
+        f"{show(buckets['WATCH'])}\n\n"
+        f"本輪錯誤：{error_count}\n"
+        f"主巡查：每10分鐘；"
+        f"READY/ENTRY_CHECK 後每1分鐘快掃。"
+    )
+
+    success = send_ntfy(
+        "台股 3-5% Monitor Summary",
+        message,
+        "default",
+        "bar_chart"
+    )
+
+    if success:
+        state[
+            "last_summary_utc"
+        ] = now_iso()
+
+
+
+def apply_fixed_setup_target(r, state):
+    """READY 後用固定目標重算剩餘空間與狀態，避免快掃追價。"""
+    code = r["code"]
+    symbol_state = (
+        state
+        .setdefault("symbols", {})
+        .setdefault(code, {})
+    )
+
+    p = r.get("potential") or {}
+    status = r.get("status")
+
+    fixed_target = symbol_state.get("setup_target_price")
+
+    if (
+        fixed_target is None
+        and status in ("WATCH", "READY", "ENTRY_CHECK", "ENTRY")
+        and r.get("1h_trend")
+        and r.get("15m_ready")
+    ):
+        fixed_target = p.get("target_price")
+        if fixed_target is not None:
+            symbol_state["setup_target_price"] = fixed_target
+            symbol_state["setup_target_time"] = now_iso()
+
+    if fixed_target is not None:
+        current = r.get("price")
+        left = None
+        if current is not None and current > 0:
+            left = (fixed_target / current - 1) * 100
+
+        r["fixed_target_price"] = fixed_target
+        r["fixed_left_pct"] = left
+
+        if p:
+            p["dynamic_target_price"] = p.get("target_price")
+            p["target_price"] = fixed_target
+            p["potential_pct"] = left
+
+        if status == "ENTRY" and (
+            left is None or left < MIN_ENTRY_SPACE_PCT
+        ):
+            r["status"] = "ENTRY_CHECK"
+
+        elif status == "READY" and (
+            left is None or left < MIN_READY_SPACE_PCT
+        ):
+            r["status"] = "WATCH"
+
+    return r
+
+
+def enrich_tw35_result(r):
+    p = r.get("potential") or {}
+    current = r.get("price")
+    target = (
+        r.get("fixed_target_price")
+        or p.get("target_price")
+    )
+
+    r["display_current_price"] = current
+    r["display_target_price"] = target
+
+    if current and target and current > 0:
+        r["remaining_space_pct"] = (target / current - 1) * 100
+    else:
+        r["remaining_space_pct"] = None
+
+    r["support_price"] = p.get("support")
+    r["resistance_price"] = p.get("resistance")
+
+    entry = current
+    r["breakeven_price"] = tw_net_exit_price(entry, r["code"], 0.0)
+    r["net_tp3_price"] = tw_net_exit_price(entry, r["code"], 3.0)
+    r["net_tp5_price"] = tw_net_exit_price(entry, r["code"], 5.0)
+
+    return r
+
+
+def build_tw2560_notify_block(r):
+    return (
+        f"TW2560狀態：{r.get('tw2560_status', 'N/A')}\\n"
+        f"TW2560方向：{r.get('tw2560_bias', 'N/A')}\\n"
+    )
+
+
+# ============================================================
+# 執行單一結果
+# ============================================================
+
+def process_result(
+    r,
+    state
+):
+    r = apply_fixed_setup_target(r, state)
+    r = enrich_tw35_result(r)
+
+    code = r["code"]
+
+    if r["status"] in (
+        "WAIT_HISTORY",
+        "STALE_DATA",
+    ):
+        print(
+            f"{code:<6} "
+            f"{r['status']}"
+        )
+        return
+
+    p = (
+        r.get("potential")
+        or {}
+    )
+
+    extra = ""
+
+    if p.get(
+        "potential_pct"
+    ) is not None:
+        extra = (
+            f" potential="
+            f"{pct_text(p.get('potential_pct'))}"
+        )
+
+    if r["status"] == "NO_SIGNAL":
+        print(
+            f"{code:<6} NO_SIGNAL "
+            f"price={price_text(r['price'])} "
+            f"TW2560={r.get('tw2560_status','N/A')}"
+        )
+    else:
+        print(
+            f"{code:<6} "
+            f"{r['status']:<12} "
+            f"now={price_text(r.get('display_current_price'))} "
+            f"target={price_text(r.get('display_target_price'))} "
+            f"left={pct_text(r.get('remaining_space_pct'))} "
+            f"support={price_text(r.get('support_price'))} "
+            f"resist={price_text(r.get('resistance_price'))} "
+            f"TW2560={r.get('tw2560_status','N/A')} "
+            f"bias={r.get('tw2560_bias','N/A')} "
+            f"1H={r['1h_trend']} "
+            f"15m={r['15m_ready']} "
+            f"5m={r['5m_entry']}"
+        )
+
+    notify_status(
+        r,
+        state
+    )
+
+
+# ============================================================
+# READY 快掃
+# ============================================================
+
+def fast_scan_ready(state):
+    for round_no in range(
+        1,
+        FAST_SCAN_ROUNDS + 1
+    ):
+        candidates = []
+
+        for code, symbol_state in (
+            state
+            .get(
+                "symbols",
+                {}
+            )
+            .items()
+        ):
+            if symbol_state.get(
+                "status"
+            ) not in (
+                "READY",
+                "ENTRY_CHECK",
+            ):
+                continue
+
+            if code not in TW_STOCKS:
+                continue
+
+            candidates.append(code)
+
+        if not candidates:
+            print(
+                "FAST SCAN: no READY / ENTRY_CHECK symbols"
+            )
+            return
+
+        if not tw_market_open():
+            print(
+                "FAST SCAN: Taiwan market closed"
+            )
+            return
+
+        print(
+            f"\nFAST SCAN "
+            f"{round_no}/{FAST_SCAN_ROUNDS} "
+            f"| wait {FAST_SCAN_SECONDS}s "
+            f"| symbols={','.join(candidates)}"
+        )
+
+        time.sleep(
+            FAST_SCAN_SECONDS
+        )
+
+        for code in candidates:
+            try:
+                r = analyze(
+                    code,
+                    TW_STOCKS[code]
+                )
+
+                process_result(
+                    r,
+                    state
+                )
+
+                save_state(
+                    state
+                )
+
+            except Exception as e:
+                print(
+                    f"{code}: "
+                    f"FAST SCAN ERROR {e}"
+                )
+
+            time.sleep(
+                0.15
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print(
+        "Taiwan Stock 3~5% Monitor | FINAL 2026-09-29 25-STOCK POOL"
+    )
+
+    print(
+        "UTC:",
+        now_iso()
+    )
+
+    print(
+        "TW market open:",
+        tw_market_open()
+    )
+
+    print(
+        "Manual run:",
+        MANUAL_RUN
+    )
+
+    state = load_state()
+
+    # 非台股交易時間，手動執行只顯示狀態，不掃市場。
+    if not tw_market_open():
+        print(
+            "TW-STOCK SKIP: outside "
+            "09:00-13:30 Taipei time"
+        )
+        save_state(state)
+        return
+
+    results = []
+    errors = []
+
+    for code, yahoo_symbol in TW_STOCKS.items():
+        try:
+            r = analyze(
+                code,
+                yahoo_symbol
+            )
+
+            process_result(
+                r,
+                state
+            )
+
+            results.append(r)
+
+        except Exception as e:
+            errors.append(
+                (
+                    code,
+                    str(e)
+                )
+            )
+
+            print(
+                f"{code:<6} ERROR {e}"
+            )
+
+        time.sleep(
+            0.15
+        )
+
+    send_summary(
+        results,
+        state,
+        len(errors),
+        force=MANUAL_RUN
+    )
+
+    save_state(
+        state
+    )
+
+    # READY 已先通過 2.5% 空間門檻。
+    # 才留下 runner 做每分鐘快掃。
+    fast_scan_ready(
+        state
+    )
+
+    save_state(
+        state
+    )
+
+    print(
+        "\nERROR COUNT:",
+        len(errors)
+    )
+
+    print(
+        "STATE FILE:",
+        STATE_FILE
+    )
+
+
+if __name__ == "__main__":
+    main()
